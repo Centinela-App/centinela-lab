@@ -1,0 +1,41 @@
+spring:
+  application:
+    name: centinela-lab
+  thymeleaf:
+    cache: true
+
+server:
+  port: ${SERVER_PORT:8081}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, info
+  endpoint:
+    health:
+      probes:
+        enabled: true
+
+centinela:
+  # Direccion publica de la API de Centinela. Sin valor por defecto a proposito:
+  # arrancar apuntando a un sitio equivocado es peor que no arrancar.
+  base-url: ${CENTINELA_BASE_URL}
+
+  # Ambito del token de Entra ID. Corresponde al app role SERVICE, el mismo que
+  # usaria un banco originador.
+  scope: ${CENTINELA_SCOPE}
+
+  espera:
+    # El motor puntua en segundos; el margen cubre el arranque en frio de la
+    # Container App cuando esta escalada a cero.
+    analisis-segundos: ${CENTINELA_WAIT_ANALYSIS:45}
+    # El explicador corre en su propio ciclo. Si esta detenido, esta espera se
+    # agota y el caso se muestra como PENDING, que es justo lo que la
+    # sustentacion debe evidenciar.
+    explicacion-segundos: ${CENTINELA_WAIT_EXPLANATION:60}
+    intervalo-segundos: ${CENTINELA_POLL_INTERVAL:3}
+
+logging:
+  level:
+    com.centinelalab: INFO

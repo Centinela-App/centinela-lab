@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="es" xmlns:th="http://www.thymeleaf.org">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Banco de pruebas de Centinela</title>
+    <link rel="stylesheet" th:href="@{/lab.css}">
+</head>
+<body>
+
+<header class="cabecera">
+    <h1>Banco de pruebas de Centinela</h1>
+    <p class="subtitulo">
+        Cada botón fabrica tráfico con una forma concreta y lo entrega a Centinela por su API
+        pública. La decisión de marcar o no marcar es enteramente de Centinela; esta pantalla
+        solo muestra lo que decidió.
+    </p>
+    <p class="destino">Apuntando a <code th:text="${centinelaBaseUrl}">—</code></p>
+</header>
+
+<main>
+    <!-- ================= Escenarios de detección ================= -->
+    <section class="bloque">
+        <h2>Causales de alerta</h2>
+
+        <div class="tarjetas">
+            <form class="tarjeta" th:each="escenario : ${escenarios}"
+                  th:action="@{'/escenarios/' + ${escenario.id()}}" method="post">
+
+                <div class="tarjeta-cabecera">
+                    <h3 th:text="${escenario.label()}">Escenario</h3>
+                    <span class="etiqueta"
+                          th:classappend="${escenario.expectsCase()} ? 'etiqueta-alerta' : 'etiqueta-limpia'"
+                          th:text="${escenario.expectsCase()} ? 'Debe alertar' : 'No debe alertar'">—</span>
+                </div>
+
+                <p class="descripcion" th:text="${escenario.description()}">Descripción</p>
+                <p class="expectativa" th:text="${escenario.expectation()}">Expectativa</p>
+
+                <button type="submit">Lanzar</button>
+            </form>
+        </div>
+    </section>
+
+    <!-- ================= Carga sostenida ================= -->
+    <section class="bloque">
+        <h2>Carga sostenida</h2>
+        <p class="descripcion">
+            Genera tráfico constante para forzar el escalado de la plataforma. Las transacciones
+            son inocuas a propósito: si generaran casos, miles de registros de prueba se
+            mezclarían con los reales.
+        </p>
+
+        <form class="formulario-carga" th:action="@{/carga}" method="post">
+            <label>
+                Transacciones por segundo
+                <input type="number" name="tasa" value="20" min="1" max="50">
+            </label>
+            <label>
+                Duración (segundos)
+                <input type="number" name="duracion" value="120" min="1" max="300">
+            </label>
+            <button type="submit">Generar carga</button>
+        </form>
+
+        <div class="reporte" th:if="${reporteCarga}">
+            <h3>Resultado de la carga</h3>
+            <ul>
+                <li>Tasa solicitada: <strong th:text="${reporteCarga.tasaPorSegundo()} + ' tx/s'">—</strong></li>
+                <li>Tasa efectiva: <strong th:text="${#numbers.formatDecimal(reporteCarga.tasaEfectiva(), 1, 1)} + ' tx/s'">—</strong></li>
+                <li>Aceptadas: <strong th:text="${reporteCarga.aceptadas()}">—</strong></li>
+                <li>
+                    Rechazadas: <strong th:text="${reporteCarga.rechazadas()}">—</strong>
+                    <span class="nota">— un 429 aquí es el limitador de tasa de Centinela funcionando, no un error</span>
+                </li>
+            </ul>
+            <p class="nota">
+                Para ver el escalado, ejecutar en paralelo desde el repositorio de Centinela:
+                <code>bash scripts/verify/verify-scaling.sh</code>
+            </p>
+        </div>
+    </section>
+
+    <!-- ================= Resultado del escenario ================= -->
+    <section class="bloque resultado" th:if="${resultado}">
+        <div class="resultado-cabecera">
+            <h2 th:text="'Resultado: ' + ${resultado.scenario().label()}">Resultado</h2>
+            <span class="veredicto"
+                  th:classappend="${resultado.verdict() == 'MARCADA'} ? 'veredicto-marcada' :
+                                  (${resultado.verdict() == 'ERROR'} ? 'veredicto-error' : 'veredicto-limpia')"
+                  th:text="${resultado.verdict()}">—</span>
+        </div>
+
+        <p class="error" th:if="${resultado.error()}" th:text="${resultado.error()}">error</p>
+
+        <div th:unless="${resultado.error()}">
+
+            <div class="contraste"
+                 th:classappend="${resultado.matchesExpectation()} ? 'contraste-ok' : 'contraste-divergente'">
+                <span th:if="${resultado.matchesExpectation()}">
+                    Centinela decidió lo que el escenario anticipaba.
+                </span>
+                <span th:unless="${resultado.matchesExpectation()}">
+                    Centinela decidió algo distinto de lo anticipado. Esto no es un fallo de esta
+                    herramienta: es un hallazgo sobre el motor o sobre la expectativa.
+                </span>
+            </div>
+
+            <dl class="datos">
+                <dt>Transacción observada</dt>
+                <dd><code th:text="${resultado.observedTransactionId()}">—</code></dd>
+
+                <dt>Transacciones enviadas</dt>
+                <dd th:text="${#lists.size(resultado.transactionIds())} + ' (incluye el historial sembrado)'">—</dd>
+
+                <dt>Score</dt>
+                <dd>
+                    <strong th:text="${resultado.score()}">—</strong>
+                    <span th:if="${resultado.threshold()}" th:text="' (umbral: ' + ${resultado.threshold()} + ')'">—</span>
+                </dd>
+
+                <dt>Duración total</dt>
+                <dd th:text="${resultado.elapsedMillis()} + ' ms'">—</dd>
+
+                <dt>Traza</dt>
+                <dd>
+                    <code th:text="${traceId}">—</code>
+                    <span class="nota">— buscar este identificador en Application Insights</span>
+                </dd>
+            </dl>
+
+            <div th:if="${!#lists.isEmpty(resultado.triggeredRules())}">
+                <h3>Reglas activadas</h3>
+                <table>
+                    <thead>
+                    <tr><th>Regla</th><th>Identificador</th><th>Puntos</th></tr>
+                    </thead>
+                    <tbody>
+                    <tr th:each="regla : ${resultado.triggeredRules()}">
+                        <td th:text="${regla.ruleName()}">—</td>
+                        <td><code th:text="${regla.ruleId()}">—</code></td>
+                        <td th:text="'+' + ${regla.points()}">—</td>
+                    </tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <div th:if="${resultado.caseStatus()}">
+                <h3>Caso abierto</h3>
+                <p>Estado: <strong th:text="${resultado.caseStatus()}">—</strong></p>
+
+                <div th:if="${resultado.explanationPending()}" class="pendiente">
+                    <strong>Explicación pendiente.</strong>
+                    El caso se abrió correctamente pero el explicador aún no lo ha procesado.
+                    Si el explicador está detenido, el caso permanecerá así hasta que se
+                    restablezca — y entonces la explicación se generará sola.
+                </div>
+
+                <pre class="explicacion" th:if="${resultado.explanation()}"
+                     th:text="${resultado.explanation()}">—</pre>
+            </div>
+
+            <div th:if="${!#lists.isEmpty(resultado.documents())}">
+                <h3>Documentos de verificación</h3>
+                <table>
+                    <thead>
+                    <tr><th>Estado</th><th>Nombre extraído</th><th>Documento</th><th>Motivo del fallo</th></tr>
+                    </thead>
+                    <tbody>
+                    <tr th:each="documento : ${resultado.documents()}">
+                        <td><code th:text="${documento.state()}">—</code></td>
+                        <td th:text="${documento.fullName()} ?: '—'">—</td>
+                        <td th:text="${documento.documentNumber()} ?: '—'">—</td>
+                        <td th:text="${documento.failureReason()} ?: '—'">—</td>
+                    </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </section>
+</main>
+
+<footer>
+    <p>
+        Esta aplicación es un cliente externo de Centinela. No comparte código, base de datos ni
+        despliegue con él: se comunica únicamente por su API pública.
+    </p>
+</footer>
+
+</body>
+</html>

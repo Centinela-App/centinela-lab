@@ -1,0 +1,17 @@
+# Credenciales y configuracion local. NUNCA versionar.
+.env
+.env.local
+*.pem
+*.key
+*.pfx
+
+# Artefactos de construccion
+target/
+!.mvn/wrapper/maven-wrapper.jar
+
+# Entorno de desarrollo
+.idea/
+*.iml
+*.iws
+.vscode/
+.DS_Store

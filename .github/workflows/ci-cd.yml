@@ -1,0 +1,124 @@
+# =============================================================================
+# Pipeline propio del banco de pruebas.
+#
+# Es un repositorio independiente y tiene su propio ciclo: se construye, se
+# prueba y se despliega sin coordinarse con Centinela. Comparte el registro de
+# contenedores y el entorno de Container Apps porque duplicarlos costaria dinero
+# sin aportar aislamiento — el aislamiento que importa es el del codigo y el de
+# la identidad, y ambos se mantienen.
+#
+# Sin credenciales: autenticacion por OIDC, igual que en Centinela.
+# =============================================================================
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: cicd-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pruebas:
+    name: Construccion y pruebas
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: temurin
+          cache: maven
+
+      # Las pruebas verifican que cada escenario genera de verdad la forma de
+      # trafico que promete. Si el escenario de monto atipico enviara un monto
+      # normal, el resultado seria "Centinela no alerto" y la celula perderia
+      # horas buscando el fallo en el motor equivocado.
+      - name: Construir y probar
+        run: mvn -B -ntp verify
+
+      - name: Verificar que no hay credenciales versionadas
+        run: |
+          if git ls-files --error-unmatch .env >/dev/null 2>&1; then
+            echo "::error::.env esta versionado."
+            exit 1
+          fi
+          if grep -rIn --exclude-dir=.git -E "(AccountKey=|client_secret|BEGIN [A-Z ]*PRIVATE KEY)" . ; then
+            echo "::error::Posible credencial en el repositorio."
+            exit 1
+          fi
+          echo "OK: sin credenciales versionadas."
+
+  desplegar:
+    name: Publicar y desplegar
+    needs: pruebas
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Autenticarse en Azure con OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Autenticarse en el registro
+        run: az acr login --name "${{ vars.NAME_PREFIX }}acr"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Construir y publicar la imagen
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ vars.NAME_PREFIX }}acr.azurecr.io/centinela-lab:${{ github.sha }}
+            ${{ vars.NAME_PREFIX }}acr.azurecr.io/centinela-lab:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+      - name: Desplegar en Container Apps
+        run: |
+          APP="ca-${{ vars.NAME_PREFIX }}-lab"
+          IMAGEN="${{ vars.NAME_PREFIX }}acr.azurecr.io/centinela-lab:${{ github.sha }}"
+
+          if az containerapp show -g "${{ vars.AZURE_RESOURCE_GROUP }}" -n "$APP" >/dev/null 2>&1; then
+            az containerapp update -g "${{ vars.AZURE_RESOURCE_GROUP }}" -n "$APP" --image "$IMAGEN"
+          else
+            # Escala a cero cuando nadie la usa: es una herramienta de demostracion,
+            # no un servicio, y mantenerla despierta consumiria credito sin motivo.
+            az containerapp create \
+              -g "${{ vars.AZURE_RESOURCE_GROUP }}" -n "$APP" \
+              --environment "cae-${{ vars.NAME_PREFIX }}" \
+              --image "$IMAGEN" \
+              --user-assigned "$(az identity show -n 'id-${{ vars.NAME_PREFIX }}-acrpull' -g '${{ vars.AZURE_RESOURCE_GROUP }}' --query id -o tsv)" \
+              --registry-server "${{ vars.NAME_PREFIX }}acr.azurecr.io" \
+              --registry-identity "$(az identity show -n 'id-${{ vars.NAME_PREFIX }}-acrpull' -g '${{ vars.AZURE_RESOURCE_GROUP }}' --query id -o tsv)" \
+              --target-port 8081 --ingress external \
+              --cpu 0.5 --memory 1.0Gi \
+              --min-replicas 0 --max-replicas 2 \
+              --env-vars \
+                CENTINELA_BASE_URL="${{ vars.CENTINELA_BASE_URL }}" \
+                CENTINELA_SCOPE="${{ vars.CENTINELA_SCOPE }}"
+          fi
+
+          FQDN=$(az containerapp show -g "${{ vars.AZURE_RESOURCE_GROUP }}" -n "$APP" \
+            --query properties.configuration.ingress.fqdn -o tsv)
+          echo "### Banco de pruebas desplegado" >> "$GITHUB_STEP_SUMMARY"
+          echo "https://$FQDN" >> "$GITHUB_STEP_SUMMARY"
