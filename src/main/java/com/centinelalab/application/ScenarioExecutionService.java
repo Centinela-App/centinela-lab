@@ -62,9 +62,21 @@ public final class ScenarioExecutionService {
             List<TransactionPayload> secuencia = TransactionFactory.build(scenario, accountId);
             List<String> enviadas = new ArrayList<>();
 
-            for (TransactionPayload transaccion : secuencia) {
-                centinela.submitTransaction(transaccion, traceparent);
-                enviadas.add(transaccion.transactionId());
+            for (int i = 0; i < secuencia.size(); i++) {
+                // El historial tiene que estar ASENTADO antes de enviar la transaccion
+                // observada. Los eventos se procesan en paralelo del otro lado: sin esta
+                // espera, el motor puntua la observada contra un pasado que todavia no es
+                // visible y ninguna regla se activa (carrera observada en despliegue real:
+                // las ocho transacciones del escenario de velocidad llegaron a la vez y
+                // todas puntuaron 0 sobre un historial vacio).
+                boolean esLaObservada = i == secuencia.size() - 1;
+                if (esLaObservada && !enviadas.isEmpty()) {
+                    for (String previa : enviadas) {
+                        sondear(() -> centinela.fetchAnalysis(previa, traceparent), esperaAnalisis);
+                    }
+                }
+                centinela.submitTransaction(secuencia.get(i), traceparent);
+                enviadas.add(secuencia.get(i).transactionId());
             }
 
             // La ultima es la que se observa; las anteriores solo construyen el pasado
