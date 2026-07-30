@@ -7,7 +7,6 @@
 
 # Artefactos de construccion
 target/
-!.mvn/wrapper/maven-wrapper.jar
 
 # Entorno de desarrollo
 .idea/
