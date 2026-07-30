@@ -4,10 +4,18 @@
 # Es un repositorio independiente y tiene su propio ciclo: se construye, se
 # prueba y se despliega sin coordinarse con Centinela. Comparte el registro de
 # contenedores y el entorno de Container Apps porque duplicarlos costaria dinero
-# sin aportar aislamiento — el aislamiento que importa es el del codigo y el de
-# la identidad, y ambos se mantienen.
+# y romperia la traza de extremo a extremo sin aportar aislamiento — el
+# aislamiento que importa es el del codigo y el de la identidad, y ambos se
+# mantienen: repositorio propio, imagen propia, identidad propia con sus roles.
 #
 # Sin credenciales: autenticacion por OIDC, igual que en Centinela.
+#
+# El despliegue delega en scripts/deploy-lab.sh en lugar de repetir aqui la
+# secuencia de comandos. No es solo evitar duplicacion: mientras esa secuencia
+# vivio dentro del YAML, era imposible desplegar el banco de pruebas a mano de la
+# misma forma que lo hace el pipeline, y las dos rutas divergieron —al workflow le
+# faltaba AZURE_CLIENT_ID y usaba la identidad del registro como identidad de la
+# aplicacion. Con un script unico hay una sola definicion de "desplegar esto".
 # =============================================================================
 name: CI/CD
 
@@ -16,6 +24,11 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      etiqueta:
+        description: 'Etiqueta de imagen a desplegar (por defecto, el SHA del commit)'
+        required: false
 
 permissions:
   contents: read
@@ -47,6 +60,14 @@ jobs:
       - name: Construir y probar
         run: mvn -B -ntp verify
 
+      - name: Publicar informes de prueba
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: informes-de-prueba
+          path: target/surefire-reports/
+          retention-days: 7
+
       - name: Verificar que no hay credenciales versionadas
         run: |
           if git ls-files --error-unmatch .env >/dev/null 2>&1; then
@@ -54,12 +75,23 @@ jobs:
             exit 1
           fi
           # --exclude=ci-cd.yml: este archivo contiene los patrones de busqueda
-          # y sin la exclusion el escaneo se detecta a si mismo.
-          if grep -rIn --exclude-dir=.git --exclude=ci-cd.yml -E "(AccountKey=|client_secret|BEGIN [A-Z ]*PRIVATE KEY)" . ; then
+          # y sin la exclusion el escaneo se detecta a si mismo. Igual con
+          # deploy-lab.sh, que documenta el nombre de las variables de credencial.
+          if grep -rIn --exclude-dir=.git --exclude-dir=target \
+               --exclude=ci-cd.yml --exclude=deploy-lab.sh \
+               -E "(AccountKey=|client_secret|BEGIN [A-Z ]*PRIVATE KEY)" . ; then
             echo "::error::Posible credencial en el repositorio."
             exit 1
           fi
           echo "OK: sin credenciales versionadas."
+
+      - name: Verificar la sintaxis de los scripts
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          # Compuerta a nivel 'error', igual que en Centinela: los errores rompen
+          # la ejecucion y deben bloquear; los avisos de estilo se informan aparte.
+          shellcheck -S error scripts/*.sh
+          shellcheck -S warning scripts/*.sh || true
 
   desplegar:
     name: Publicar y desplegar
@@ -69,10 +101,11 @@ jobs:
     # valor 'true', el job se salta sin fallar: permite tener CI en verde
     # antes de provisionar la infraestructura de Azure. Se usa una variable y
     # no un secret porque el contexto 'secrets' no esta disponible en el 'if'
-    # de un job.
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push' && vars.DESPLIEGUE_HABILITADO == 'true'
+    # de un job. El disparo manual lo ignora a proposito, para poder hacer el
+    # primer despliegue controlado antes de dejarlo automatico.
+    if: ${{ (github.ref == 'refs/heads/main' && github.event_name == 'push' && vars.DESPLIEGUE_HABILITADO == 'true') || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v4
@@ -84,49 +117,42 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Autenticarse en el registro
-        run: az acr login --name "${{ vars.NAME_PREFIX }}acr"
-
-      - uses: docker/setup-buildx-action@v3
-
-      - name: Construir y publicar la imagen
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: |
-            ${{ vars.NAME_PREFIX }}acr.azurecr.io/centinela-lab:${{ github.sha }}
-            ${{ vars.NAME_PREFIX }}acr.azurecr.io/centinela-lab:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          provenance: false
-
-      - name: Desplegar en Container Apps
+      # Una sola invocacion. El script construye la imagen en Azure con
+      # `az acr build` (el runner no necesita Docker), asegura la identidad del
+      # banco de pruebas, crea o actualiza la Container App y comprueba que
+      # responde 200 antes de darse por bueno.
+      #
+      # --skip-role: conceder un app role exige escritura en el directorio.
+      # Darsela al service principal del pipeline significaria que quien pueda
+      # editar este workflow puede concederse roles de aplicacion. Es un paso de
+      # aprovisionamiento que hace una persona una vez.
+      - name: Desplegar el banco de pruebas
+        env:
+          SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+          LOCATION: ${{ vars.AZURE_LOCATION }}
+          NAME_PREFIX: ${{ vars.NAME_PREFIX }}
+          # Identificadores publicos, no secretos. Evitan que el pipeline
+          # necesite permiso de lectura sobre Microsoft Graph.
+          CENTINELA_ENTRA_APP_ID: ${{ vars.CENTINELA_ENTRA_APP_ID }}
+          CENTINELA_API_FQDN: ${{ vars.CENTINELA_API_FQDN }}
         run: |
-          APP="ca-${{ vars.NAME_PREFIX }}-lab"
-          IMAGEN="${{ vars.NAME_PREFIX }}acr.azurecr.io/centinela-lab:${{ github.sha }}"
+          bash scripts/deploy-lab.sh \
+            --yes --skip-role \
+            --tag "${{ inputs.etiqueta || github.sha }}"
 
-          if az containerapp show -g "${{ vars.AZURE_RESOURCE_GROUP }}" -n "$APP" >/dev/null 2>&1; then
-            az containerapp update -g "${{ vars.AZURE_RESOURCE_GROUP }}" -n "$APP" --image "$IMAGEN"
-          else
-            # Escala a cero cuando nadie la usa: es una herramienta de demostracion,
-            # no un servicio, y mantenerla despierta consumiria credito sin motivo.
-            az containerapp create \
-              -g "${{ vars.AZURE_RESOURCE_GROUP }}" -n "$APP" \
-              --environment "cae-${{ vars.NAME_PREFIX }}" \
-              --image "$IMAGEN" \
-              --user-assigned "$(az identity show -n 'id-${{ vars.NAME_PREFIX }}-acrpull' -g '${{ vars.AZURE_RESOURCE_GROUP }}' --query id -o tsv)" \
-              --registry-server "${{ vars.NAME_PREFIX }}acr.azurecr.io" \
-              --registry-identity "$(az identity show -n 'id-${{ vars.NAME_PREFIX }}-acrpull' -g '${{ vars.AZURE_RESOURCE_GROUP }}' --query id -o tsv)" \
-              --target-port 8081 --ingress external \
-              --cpu 0.5 --memory 1.0Gi \
-              --min-replicas 0 --max-replicas 2 \
-              --env-vars \
-                CENTINELA_BASE_URL="${{ vars.CENTINELA_BASE_URL }}" \
-                CENTINELA_SCOPE="${{ vars.CENTINELA_SCOPE }}"
-          fi
-
-          FQDN=$(az containerapp show -g "${{ vars.AZURE_RESOURCE_GROUP }}" -n "$APP" \
-            --query properties.configuration.ingress.fqdn -o tsv)
-          echo "### Banco de pruebas desplegado" >> "$GITHUB_STEP_SUMMARY"
-          echo "https://$FQDN" >> "$GITHUB_STEP_SUMMARY"
+      - name: Resumen
+        if: always()
+        env:
+          RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+          NAME_PREFIX: ${{ vars.NAME_PREFIX }}
+        run: |
+          FQDN=$(az containerapp show -g "$RESOURCE_GROUP" -n "ca-${NAME_PREFIX}-lab" \
+            --query properties.configuration.ingress.fqdn -o tsv 2>/dev/null || true)
+          {
+            echo "### Banco de pruebas"
+            echo ""
+            echo "- Commit: \`${{ github.sha }}\`"
+            echo "- Resultado: ${{ job.status }}"
+            [ -n "$FQDN" ] && echo "- Direccion: https://$FQDN"
+          } >> "$GITHUB_STEP_SUMMARY"
