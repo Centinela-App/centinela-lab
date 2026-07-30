@@ -523,10 +523,14 @@ construir_imagen() {
     docker push "${registry}/centinela-lab:${IMAGE_TAG}"
   else
     log_info "Construyendo en Azure con 'az acr build' (sin Docker local)..."
-    az acr build --registry "$REGISTRY_NAME" \
+    # La CLI resuelve --file contra el directorio ACTUAL, no contra el
+    # contexto: si este script se invoca desde otro repositorio (p. ej.
+    # deploy-platform.sh --with-lab), '--file Dockerfile' apuntaria al
+    # Dockerfile equivocado. Se fija cwd = contexto en un subshell.
+    (cd "$REPO_ROOT" && az acr build --registry "$REGISTRY_NAME" \
       --image "centinela-lab:${IMAGE_TAG}" \
       --image "centinela-lab:latest" \
-      --file Dockerfile "$REPO_ROOT"
+      --file Dockerfile .)
   fi
 }
 
