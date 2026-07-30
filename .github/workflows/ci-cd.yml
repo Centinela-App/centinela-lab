@@ -53,7 +53,9 @@ jobs:
             echo "::error::.env esta versionado."
             exit 1
           fi
-          if grep -rIn --exclude-dir=.git -E "(AccountKey=|client_secret|BEGIN [A-Z ]*PRIVATE KEY)" . ; then
+          # --exclude=ci-cd.yml: este archivo contiene los patrones de busqueda
+          # y sin la exclusion el escaneo se detecta a si mismo.
+          if grep -rIn --exclude-dir=.git --exclude=ci-cd.yml -E "(AccountKey=|client_secret|BEGIN [A-Z ]*PRIVATE KEY)" . ; then
             echo "::error::Posible credencial en el repositorio."
             exit 1
           fi
