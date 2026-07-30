@@ -30,10 +30,14 @@ on:
         description: 'Etiqueta de imagen a desplegar (por defecto, el SHA del commit)'
         required: false
 
+# Permiso minimo por defecto; 'id-token: write' solo lo recibe el job que
+# de verdad se autentica contra Azure (ver 'desplegar').
 permissions:
   contents: read
-  id-token: write
 
+# Cancelar una ejecucion de PRUEBAS obsoleta ahorra minutos de runner. El job de
+# despliegue tiene su propia concurrencia mas abajo, SIN cancelacion: abortar un
+# 'az containerapp update' a la mitad deja el entorno en estado desconocido.
 concurrency:
   group: cicd-${{ github.ref }}
   cancel-in-progress: true
@@ -103,9 +107,21 @@ jobs:
     # no un secret porque el contexto 'secrets' no esta disponible en el 'if'
     # de un job. El disparo manual lo ignora a proposito, para poder hacer el
     # primer despliegue controlado antes de dejarlo automatico.
-    if: ${{ (github.ref == 'refs/heads/main' && github.event_name == 'push' && vars.DESPLIEGUE_HABILITADO == 'true') || github.event_name == 'workflow_dispatch' }}
+    #
+    # El guard de rama aplica TAMBIEN al disparo manual: la credencial federada
+    # de OIDC solo cubre refs/heads/main, y dispararlo desde otra rama fallaria
+    # en el login con un error de Entra que no menciona la rama.
+    if: ${{ github.ref == 'refs/heads/main' && ((github.event_name == 'push' && vars.DESPLIEGUE_HABILITADO == 'true') || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
+
+    permissions:
+      contents: read
+      id-token: write
+
+    concurrency:
+      group: cicd-despliegue
+      cancel-in-progress: false
 
     steps:
       - uses: actions/checkout@v4
@@ -117,6 +133,12 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
+      # Sin la extension, el primer 'az containerapp ...' del script muere y el
+      # preflight lo reporta como "No existe el entorno", que apunta al sitio
+      # equivocado. Instalarla explicitamente elimina ese diagnostico falso.
+      - name: Preparar la extension containerapp
+        run: az extension add --name containerapp --upgrade
+
       # Una sola invocacion. El script construye la imagen en Azure con
       # `az acr build` (el runner no necesita Docker), asegura la identidad del
       # banco de pruebas, crea o actualiza la Container App y comprueba que
@@ -126,6 +148,11 @@ jobs:
       # Darsela al service principal del pipeline significaria que quien pueda
       # editar este workflow puede concederse roles de aplicacion. Es un paso de
       # aprovisionamiento que hace una persona una vez.
+      #
+      # --skip-acrpull: misma logica en el plano RBAC de Azure. El SP del
+      # pipeline tiene AcrPush y Contributor, y Contributor NO puede escribir
+      # asignaciones de rol: conceder AcrPull desde aqui muere con
+      # AuthorizationFailed. Tambien es aprovisionamiento de una sola vez.
       - name: Desplegar el banco de pruebas
         env:
           SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
@@ -138,7 +165,7 @@ jobs:
           CENTINELA_API_FQDN: ${{ vars.CENTINELA_API_FQDN }}
         run: |
           bash scripts/deploy-lab.sh \
-            --yes --skip-role \
+            --yes --skip-role --skip-acrpull \
             --tag "${{ inputs.etiqueta || github.sha }}"
 
       - name: Resumen
