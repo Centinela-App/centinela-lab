@@ -202,7 +202,16 @@ derivar_nombres() {
   APP_NAME="ca-${NAME_PREFIX}-lab"
   IDENTITY_NAME="id-${NAME_PREFIX}-lab"
   ACRPULL_IDENTITY="id-${NAME_PREFIX}-acrpull"
-  REGISTRY_NAME="${NAME_PREFIX}acr"
+  # Los nombres de ACR son DNS global y '<prefijo>acr' a secas puede estar
+  # tomado por un tercero (ocurrio con 'centacr'). Misma derivacion con hash
+  # que usa Centinela (scripts/lib/common.sh::derive_registry_name).
+  if [ -n "${CENTINELA_REGISTRY_NAME:-}" ]; then
+    REGISTRY_NAME="$CENTINELA_REGISTRY_NAME"
+  else
+    local hash
+    hash="$(printf '%s|%s|%s' "$NAME_PREFIX" "$SUBSCRIPTION_ID" "$RESOURCE_GROUP" | sha1sum | cut -c1-6)"
+    REGISTRY_NAME="${NAME_PREFIX}acr${hash}"
+  fi
   ENVIRONMENT_NAME="cae-${NAME_PREFIX}"
   ENTRA_APP_NAME="${CENTINELA_ENTRA_APP_NAME:-${NAME_PREFIX}-api-week1}"
   [ -n "$IMAGE_TAG" ] || IMAGE_TAG="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo latest)"
