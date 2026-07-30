@@ -64,7 +64,13 @@ jobs:
   desplegar:
     name: Publicar y desplegar
     needs: pruebas
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    # DESPLIEGUE_HABILITADO es una variable del repositorio (Settings ->
+    # Secrets and variables -> Actions -> Variables). Mientras no exista con
+    # valor 'true', el job se salta sin fallar: permite tener CI en verde
+    # antes de provisionar la infraestructura de Azure. Se usa una variable y
+    # no un secret porque el contexto 'secrets' no esta disponible en el 'if'
+    # de un job.
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push' && vars.DESPLIEGUE_HABILITADO == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
 
