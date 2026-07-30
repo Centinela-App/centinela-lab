@@ -6,12 +6,14 @@ import com.centinelalab.domain.Scenario;
 import com.centinelalab.domain.ScenarioResult;
 import com.centinelalab.domain.W3CTrace;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Controller;
 import org.springframework.ui.Model;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.server.ResponseStatusException;
 
 import java.util.Arrays;
 import java.util.List;
@@ -49,7 +51,13 @@ public class LabController {
 
     @PostMapping("/escenarios/{id}")
     public String ejecutar(@PathVariable String id, Model model) {
-        Scenario scenario = Scenario.valueOf(id);
+        Scenario scenario;
+        try {
+            scenario = Scenario.valueOf(id);
+        } catch (IllegalArgumentException exception) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                    "Escenario desconocido: " + id);
+        }
         ScenarioResult resultado = escenarios.run(scenario);
 
         prepararModelo(model);

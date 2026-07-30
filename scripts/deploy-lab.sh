@@ -56,6 +56,7 @@
 #     --tag <etiqueta> Etiqueta de imagen (por defecto: SHA corto de HEAD).
 #     --skip-image     No construye; despliega la etiqueta indicada.
 #     --skip-role      No toca el app role (ya concedido). Ver mas abajo.
+#     --skip-acrpull   No toca la asignacion AcrPull (ya concedida). Ver mas abajo.
 #     --local-docker   Construye con el Docker local.
 #
 # Parametros (de .env, del entorno, o heredados del despliegue de Centinela):
@@ -82,6 +83,16 @@
 #
 # El script AVISA si con --skip-role no encuentra la asignacion, en vez de
 # desplegar en silencio algo que responderia 403 en la primera peticion.
+#
+# EJECUCION DESDE UN PIPELINE: --skip-acrpull
+# -------------------------------------------
+# Mismo razonamiento que --skip-role, pero en el plano de RBAC de Azure: escribir
+# una asignacion de rol exige Microsoft.Authorization/roleAssignments/write, que
+# Contributor NO incluye. El service principal del pipeline tiene AcrPush y
+# Contributor, asi que conceder AcrPull desde CI falla con AuthorizationFailed.
+# La concesion es un paso de aprovisionamiento que hace una persona UNA VEZ
+# (ejecutando este script sin --skip-acrpull), y el despliegue continuo corre con
+# --skip-acrpull.
 
 set -euo pipefail
 
@@ -92,6 +103,7 @@ VALIDATE_ONLY=0
 ASSUME_YES=0
 SKIP_IMAGE=0
 SKIP_ROLE=0
+SKIP_ACRPULL=0
 LOCAL_DOCKER=0
 IMAGE_TAG=""
 
@@ -103,6 +115,7 @@ while [ "$#" -gt 0 ]; do
     --yes|--force)   ASSUME_YES=1; shift ;;
     --skip-image)    SKIP_IMAGE=1; shift ;;
     --skip-role)     SKIP_ROLE=1; shift ;;
+    --skip-acrpull)  SKIP_ACRPULL=1; shift ;;
     --local-docker)  LOCAL_DOCKER=1; shift ;;
     --tag)           IMAGE_TAG="${2:?--tag requiere valor}"; shift 2 ;;
     -h|--help)       usage; exit 0 ;;
@@ -166,8 +179,9 @@ cargar_parametros() {
   done
   if [ "${#faltan[@]}" -gt 0 ]; then
     log_error "Faltan parametros: ${faltan[*]}"
-    log_error "Deben coincidir con los usados al desplegar Centinela. Definelos en .env"
-    log_error "o exportalos. Ver .env.example."
+    log_error "Deben coincidir con los usados al desplegar Centinela. Definelos en un"
+    log_error "archivo .env en la raiz del repositorio o exportalos, por ejemplo:"
+    log_error "  SUBSCRIPTION_ID=<uuid>  RESOURCE_GROUP=rg-centinela  LOCATION=eastus2  NAME_PREFIX=cent"
     exit 1
   fi
 
@@ -193,6 +207,11 @@ derivar_nombres() {
   ENTRA_APP_NAME="${CENTINELA_ENTRA_APP_NAME:-${NAME_PREFIX}-api-week1}"
   [ -n "$IMAGE_TAG" ] || IMAGE_TAG="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo latest)"
 }
+
+# Los app roles que sostiene la identidad del banco de pruebas. La justificacion
+# completa esta junto a conceder_app_roles(); se declara aqui porque preflight()
+# ya lo usa al imprimir el plan.
+readonly APP_ROLES_DEL_LAB=(SERVICE ANALYST)
 
 # --- Preflight ------------------------------------------------------------------
 
@@ -318,7 +337,7 @@ asegurar_identidad() {
 # define, en vez de concederle al banco de pruebas los dos papeles que de verdad
 # ejerce. El banco de pruebas no tiene ningun acceso a datos: solo habla por la API
 # publica, igual que cualquier cliente externo.
-readonly APP_ROLES_DEL_LAB=(SERVICE ANALYST)
+# (La declaracion de APP_ROLES_DEL_LAB esta arriba, antes de preflight.)
 
 conceder_app_roles() {
   local rol
@@ -453,7 +472,8 @@ conceder_acrpull() {
   # request did not have a subscription or a valid tenant level resource
   # provider", que no es un problema de suscripcion ni de permisos sino un defecto
   # del comando. Contra REST funciona sin cambios. Mismo camino que usa Centinela.
-  assignment_id="$(python -c 'import uuid; print(uuid.uuid4())' 2>/dev/null \
+  assignment_id="$(python3 -c 'import uuid; print(uuid.uuid4())' 2>/dev/null \
+    || python -c 'import uuid; print(uuid.uuid4())' 2>/dev/null \
     || cat /proc/sys/kernel/random/uuid 2>/dev/null)"
   [ -n "$assignment_id" ] || die "No se pudo generar un identificador de asignacion."
 
@@ -469,6 +489,11 @@ conceder_acrpull() {
 
   if [ "$codigo" -eq 0 ]; then
     log_info "Rol 'AcrPull' concedido sobre el registro."
+    # La asignacion RBAC tarda en propagar al plano de datos del registro. Sin
+    # esta espera, el primer 'az containerapp create --registry-identity' puede
+    # fallar el pull de la imagen de forma intermitente.
+    log_info "Esperando 30s la propagacion de RBAC..."
+    sleep 30
   elif printf '%s' "$salida" | grep -qi 'RoleAssignmentExists\|already exists'; then
     log_info "El rol 'AcrPull' ya estaba concedido."
   else
@@ -508,11 +533,20 @@ desplegar_app() {
 
   if az containerapp show -g "$RESOURCE_GROUP" -n "$APP_NAME" >/dev/null 2>&1; then
     log_info "Actualizando '$APP_NAME' a $imagen"
-    az containerapp update -g "$RESOURCE_GROUP" -n "$APP_NAME" --image "$imagen" --output none
-    # Las variables se reafirman en cada despliegue: si la API se recreo, su FQDN
+    # La identidad y el registro se reafirman antes del update: 'az containerapp
+    # update' no acepta --user-assigned ni --registry-identity, y si la app la
+    # creo una version anterior del pipeline con OTRA identidad, fijar
+    # AZURE_CLIENT_ID a una identidad que la app no tiene rompe
+    # DefaultAzureCredential con "no managed identity with the specified client id".
+    az containerapp identity assign -g "$RESOURCE_GROUP" -n "$APP_NAME" \
+      --user-assigned "$LAB_IDENTITY_ID" --output none
+    az containerapp registry set -g "$RESOURCE_GROUP" -n "$APP_NAME" \
+      --server "$registry" --identity "$LAB_IDENTITY_ID" --output none
+    # Imagen y variables en UNA sola invocacion (una sola revision nueva). Las
+    # variables se reafirman en cada despliegue: si la API se recreo, su FQDN
     # cambio, y un banco de pruebas apuntando a la direccion anterior falla con un
     # error de red que parece un problema de la API.
-    az containerapp update -g "$RESOURCE_GROUP" -n "$APP_NAME" \
+    az containerapp update -g "$RESOURCE_GROUP" -n "$APP_NAME" --image "$imagen" \
       --set-env-vars \
         AZURE_CLIENT_ID="$LAB_CLIENT_ID" \
         CENTINELA_BASE_URL="$base_url" \
@@ -591,7 +625,11 @@ main() {
   else
     conceder_app_roles
   fi
-  conceder_acrpull
+  if [ "$SKIP_ACRPULL" -eq 1 ]; then
+    log_warn "--skip-acrpull: no se toca la asignacion AcrPull (aprovisionada a mano)."
+  else
+    conceder_acrpull
+  fi
 
   if [ "$SKIP_IMAGE" -eq 1 ]; then
     log_warn "--skip-image: se despliega la etiqueta '$IMAGE_TAG' ya existente."

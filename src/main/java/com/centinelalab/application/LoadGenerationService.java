@@ -33,7 +33,10 @@ public final class LoadGenerationService {
     private static final Logger log = LoggerFactory.getLogger(LoadGenerationService.class);
 
     private static final int MAX_RATE_PER_SECOND = 50;
-    private static final int MAX_DURATION_SECONDS = 300;
+    // El ingress de Azure Container Apps corta la peticion HTTP a los 240 s y la
+    // ejecucion es sincrona dentro de la peticion: un tope mayor haria que el
+    // navegador recibiera un error aunque la carga siguiera corriendo detras.
+    private static final int MAX_DURATION_SECONDS = 180;
 
     private final CentinelaClientPort centinela;
 

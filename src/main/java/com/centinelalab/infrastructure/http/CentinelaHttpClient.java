@@ -101,6 +101,10 @@ public final class CentinelaHttpClient implements CentinelaClientPort {
      * Un {@code 404} NO es un error: significa "esta transaccion no fue marcada" o "el motor
      * todavia no la ha puntuado". Tratarlo como excepcion obligaria a envolver cada consulta en
      * un try/catch y convertiria el caso mas comun del escenario normal en una ruta de error.
+     *
+     * <p>Un {@code 401}/{@code 403}, en cambio, SI es un error y se propaga: significa que el
+     * token no lleva el rol requerido. Tragarselo haria que un fallo de permisos se presentara
+     * en la UI como "NO MARCADA", indistinguible de "aun no puntuada".
      */
     private Optional<Map<String, Object>> get(String path, String traceparent) {
         try {
@@ -109,9 +113,18 @@ public final class CentinelaHttpClient implements CentinelaClientPort {
                     .uri(path)
                     .headers(headers -> authenticate(headers, traceparent))
                     .retrieve()
+                    .onStatus(status -> status.value() == 401 || status.value() == 403,
+                            (request, response) -> {
+                                throw new IllegalStateException("Centinela respondio "
+                                        + response.getStatusCode().value() + " en " + path
+                                        + ": el token no lleva el rol requerido (SERVICE/ANALYST). "
+                                        + "Revisar la asignacion de app roles de la identidad del laboratorio.");
+                            })
                     .onStatus(HttpStatusCode::is4xxClientError, (request, response) -> { })
                     .body(Map.class);
             return Optional.ofNullable(cuerpo);
+        } catch (IllegalStateException exception) {
+            throw exception;
         } catch (RuntimeException exception) {
             log.debug("Consulta a {} sin resultado: {}", path, exception.getMessage());
             return Optional.empty();
